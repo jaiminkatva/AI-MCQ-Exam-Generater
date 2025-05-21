@@ -1,105 +1,6 @@
 import Exam from "../model/Exam.js";
-import { OpenAI } from "openai";
-import dotenv from "dotenv";
-dotenv.config();
+import generateMCQs from "../utils/generateMCQs.js";
 
-// Sample MCQs from jsonData
-// const jsonData = [
-//   {
-//     question:
-//       "In Mongoose, which method is used to populate associated documents referenced in a schema?",
-//     options: ["A) populate()", "B) fill()", "C) associate()", "D) link()"],
-//     correctAnswer: "A) populate()",
-//   },
-//   {
-//     question:
-//       "What is the primary purpose of the Express framework in a Node.js application?",
-//     options: [
-//       "A) To manage session cookies",
-//       "B) To serve static files",
-//       "C) To create a robust API and handle HTTP requests",
-//       "D) To interact with databases directly",
-//     ],
-//     correctAnswer: "C) To create a robust API and handle HTTP requests",
-//   },
-//   {
-//     question:
-//       "Which of the following is a valid way to declare a variable in JavaScript?",
-//     options: [
-//       "A) int number = 5;",
-//       "B) var number = 5;",
-//       "C) number = 5;",
-//       "D) let number := 5;",
-//     ],
-//     correctAnswer: "B) var number = 5;",
-//   },
-// ];
-
-// // Main function to insert exam
-// export const createAIExam = async () => {
-//   try {
-//     const newExam = new Exam({
-//       companyId: "6650d1b6b0f123456789abcd", // Replace with actual ObjectId
-//       jobId: "6650d1b6b0f123456789abce", // Replace with actual ObjectId
-//       examTitle: "Node.js & Mongoose Fundamentals",
-//       topic: "JavaScript Backend",
-//       noOfQuestion: jsonData.length,
-//       timeLimit: 30, // in minutes
-//       questions: jsonData,
-//     });
-
-//     const savedExam = await newExam.save();
-//     console.log("Exam saved:", savedExam);
-//   } catch (error) {
-//     console.error("Error creating exam:", error.message);
-//   }
-// };
-
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
-
-async function generateMCQs(prompt) {
-  try {
-    const response = await openai.chat.completions.create({
-      model: "gpt-4o",
-      messages: [{ role: "user", content: prompt }],
-      temperature: 0.7,
-    });
-
-    let content = response.choices[0].message.content?.trim();
-
-    if (!content) {
-      throw new Error("Empty response from OpenAI.");
-    }
-
-    // 🔍 Try to extract JSON array from the response
-    const match = content.match(/\[\s*{[\s\S]*}\s*]/);
-    if (!match) {
-      console.error(
-        "❌ Could not find valid JSON array in response:\n",
-        content
-      );
-      throw new Error("OpenAI returned invalid JSON format.");
-    }
-
-    try {
-      const parsed = JSON.parse(match[0]);
-      if (!Array.isArray(parsed)) {
-        throw new Error("Parsed content is not an array.");
-      }
-      return parsed;
-    } catch (parseErr) {
-      console.error("❌ Failed to parse OpenAI response:\n", match[0]);
-      throw new Error("OpenAI returned invalid JSON format.");
-    }
-  } catch (err) {
-    console.error("❌ OpenAI API Error:", err.message);
-    throw err;
-  }
-}
-
-// 📦 Controller to create and save an auto-generated MCQ exam
 export const createAIExam = async (req, res) => {
   try {
     const companyId = "682348dec6c50c7e91275a2f";
@@ -107,7 +8,6 @@ export const createAIExam = async (req, res) => {
     const { examTitle, topic, noOfQuestion, hard, medium, easy, timeLimit } =
       req.body;
 
-    // ✅ Validate inputs
     const missingFields = [];
     for (const field of [
       "examTitle",
@@ -140,15 +40,21 @@ export const createAIExam = async (req, res) => {
       });
     }
 
-    // 🧠 Create a structured prompt
-    const prompt = `
-Generate exactly ${noOfQuestion} multiple-choice questions on the topic "${topic}".
+    // Helper to generate a specific difficulty batch with retry logic
+    const generateBatchWithRetry = async (count, difficultyLabel) => {
+      let attempts = 0;
+      let collected = [];
+
+      while (collected.length < count && attempts < 3) {
+        const prompt = `
+Generate exactly ${
+          count - collected.length
+        } ${difficultyLabel} multiple-choice questions on the topic "${topic}".
 
 Instructions:
 - Each question must be clear, technical, and accurate.
 - Each must have 4 answer options, labeled like: "A) ...", "B) ...", "C) ...", "D) ...".
 - The correctAnswer must match the full option string, e.g., "B) var number = 5;".
-- Distribute difficulty as: ${hard}% hard, ${medium}% medium, ${easy}% easy.
 - Return ONLY a valid JSON array, no explanation or extra text.
 
 Format:
@@ -163,12 +69,40 @@ Format:
 Return only this JSON array, nothing else.
 `.trim();
 
-    // 🔁 Generate MCQs
-    const questions = await generateMCQs(prompt);
+        try {
+          const batch = await generateMCQs(prompt);
+          collected.push(...batch);
+        } catch (err) {
+          console.warn(
+            `⚠️ Attempt ${attempts + 1} failed for ${difficultyLabel}:`,
+            err.message
+          );
+        }
 
-    console.log(questions);
+        attempts++;
+      }
 
-    // 📝 Save exam to DB
+      if (collected.length !== count) {
+        throw new Error(
+          `Expected ${count} ${difficultyLabel} questions, but got ${collected.length}`
+        );
+      }
+
+      return collected;
+    };
+
+    // Calculate question distribution
+    const hardCount = Math.round((hard / 100) * noOfQuestion);
+    const mediumCount = Math.round((medium / 100) * noOfQuestion);
+    const easyCount = noOfQuestion - hardCount - mediumCount;
+
+    // Generate questions by difficulty
+    const hardQuestions = await generateBatchWithRetry(hardCount, "hard");
+    const mediumQuestions = await generateBatchWithRetry(mediumCount, "medium");
+    const easyQuestions = await generateBatchWithRetry(easyCount, "easy");
+
+    const questions = [...hardQuestions, ...mediumQuestions, ...easyQuestions];
+
     const newExam = new Exam({
       companyId,
       jobId,
@@ -195,4 +129,27 @@ Return only this JSON array, nothing else.
       statusCode: 500,
     });
   }
+};
+
+export const getAllExam = async (req, res) => {
+  const exams = await Exam.find();
+
+  if (!exams) {
+    res.status(404).json({
+      success: false,
+      message: "Exam not available!!",
+      status: 404,
+    });
+  }
+
+  res.status(200).json({
+    success: true,
+    data: [
+      {
+        totalExams: exams.length,
+        data: exams,
+      },
+    ],
+    status: 404,
+  });
 };
